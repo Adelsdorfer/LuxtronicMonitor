@@ -18,7 +18,7 @@
 // WLAN-KONFIGURATION
 // =========================
 const char* WIFI_SSID     = "cisco2";
-const char* WIFI_PASSWORD = "Roli2010!+";
+const char* WIFI_PASSWORD = "xx";
 
 // =========================
 // LUXTRONIK-KONFIGURATION
