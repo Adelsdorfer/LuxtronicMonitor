@@ -1,127 +1,112 @@
-// Luxtronik Monitor für ESP32-S3 (Arduino)
-// Ausgabe: Nur Temperaturwerte (Name: Wert), sonst nichts Relevantes.
-//
-// Voraussetzungen:
-//   - Board: ESP32-S3
-//   - Libraries: WiFi, WebSockets (arduinoWebSockets von Markus Sattler)
-
 #include <WiFi.h>
 #include <WebSocketsClient.h>
-#include <math.h>
+#include <Arduino_GFX_Library.h>
 #include <time.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <Adafruit_NeoPixel.h>
+#include <math.h>
+
+// ===== Farben (RGB565) =====
+#ifndef BLACK
+  #define BLACK 0x0000
+#endif
+#ifndef WHITE
+  #define WHITE 0xFFFF
+#endif
 
 // =========================
 // WLAN-KONFIGURATION
 // =========================
-const char* WIFI_SSID     = "cisco2";
-const char* WIFI_PASSWORD = "xx";
+const char* WIFI_SSID     = "SSID";
+const char* WIFI_PASSWORD = "PWD";
 
 // =========================
-// LUXTRONIK-KONFIGURATION
+// Luxtronik / Controller
 // =========================
-const char*   CONTROLLER_IP       = "192.168.0.40";
-const uint16_t CONTROLLER_PORT    = 8214;
-const char*   WS_PROTOCOL         = "Lux_WS";
-const char*   CONTROLLER_PASSWORD = "0";   // Luxtronik Passwort wie im Webinterface
+const char*  CONTROLLER_IP       = "192.168.0.40";
+const uint16_t CONTROLLER_PORT   = 8214;
+const char*  WS_PROTOCOL         = "Lux_WS";
+const char*  CONTROLLER_PASSWORD = "0";
 
-// Refresh-Intervall in Sekunden (wird bei RUN_ONCE nicht verwendet)
-const unsigned long REFRESH_INTERVAL_SEC = 5;
-
-// Nur einen kompletten Durchlauf durchführen?
+// Update alle 3 Sekunden
+const unsigned long REFRESH_INTERVAL_SEC = 3;
 const bool RUN_ONCE = false;
 
 // =========================
-// Globale Variablen
+// Display Pins (Waveshare ESP32-C6-LCD-1.47)
 // =========================
+#define PIN_LCD_MOSI  6
+#define PIN_LCD_SCLK  7
+#define PIN_LCD_CS    14
+#define PIN_LCD_DC    15
+#define PIN_LCD_RST   21
+#define PIN_LCD_BL    22
+
+#define LCD_W         172
+#define LCD_H         320
+#define LCD_X_OFFSET  34
+#define LCD_Y_OFFSET  0
+
+// 90° Rotation: 3 ist häufig "richtig" (falls andersrum: 1 testen)
+#define LCD_ROTATION  3
 
 WebSocketsClient webSocket;
 
-bool cycleComplete      = false;
+// Arduino_GFX setup (SPI Bus)
+Arduino_DataBus* bus = new Arduino_ESP32SPI(
+  PIN_LCD_DC, PIN_LCD_CS,
+  PIN_LCD_SCLK, PIN_LCD_MOSI,
+  -1 /* MISO */
+);
+
+// ST7789 with offsets
+Arduino_GFX* gfx = new Arduino_ST7789(
+  bus, PIN_LCD_RST, LCD_ROTATION,
+  true /* invert */,
+  LCD_W, LCD_H,
+  LCD_X_OFFSET, LCD_Y_OFFSET
+);
+
+// =========================
+// Status / Values
+// =========================
+bool loggedIn = false;
 unsigned long lastRefreshMs = 0;
-bool loggedIn           = false;
-float lastWarmWaterTemp = NAN;
-float lastOutsideTemp   = NAN;
-float lastVorlaufTemp   = NAN;
 
 // ID des Navigationspunkts "Temperaturen"
 String tempNavId = "";
 
-enum LedMode {
-  LED_MODE_GREEN = 0,
-  LED_MODE_RED,
-  LED_MODE_RED_BLINK,
-  LED_MODE_ORANGE
-};
+// Temperaturen (letzte Werte)
+float lastWarmWaterTemp = NAN;
+float lastOutsideTemp   = NAN;
+float lastVorlaufTemp   = NAN;
 
-LedMode requestedLedMode = LED_MODE_GREEN;
-LedMode appliedLedMode   = LED_MODE_GREEN;
-bool ledBlinkOn          = false;
-unsigned long lastLedBlinkMs = 0;
-const unsigned long LED_BLINK_INTERVAL_MS = 500;
-
-const uint8_t STATUS_LED_PIN = 48;  // eingebaute NeoPixel-LED des ESP32-S3 DevKit
-
-#if defined(NEOPIXEL_POWER_PIN)
-const int STATUS_LED_POWER_PIN = NEOPIXEL_POWER_PIN;
-#elif defined(PIN_NEOPIXEL_POWER)
-const int STATUS_LED_POWER_PIN = PIN_NEOPIXEL_POWER;
-#else
-const int STATUS_LED_POWER_PIN = 46;  // standard bei vielen ESP32-S3-Devkits
-#endif
-Adafruit_NeoPixel statusPixel(1, STATUS_LED_PIN, NEO_GRB + NEO_KHZ800);
-
-// Display
-const int SCREEN_WIDTH  = 128;
-const int SCREEN_HEIGHT = 64;
-const int OLED_RESET_PIN = -1;
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET_PIN);
-bool displayReady = false;
-bool displayDirty = true;
-
-// Zeit / Anzeige
+// NTP (optional, für Timestamp auf Display)
 const char* NTP_SERVER = "pool.ntp.org";
-const long  GMT_OFFSET_SEC = 3600;
+const long  GMT_OFFSET_SEC = 3600;   // DE
 const int   DAYLIGHT_OFFSET_SEC = 0;
 unsigned long lastNtpSyncMs = 0;
 const unsigned long NTP_SYNC_INTERVAL_MS = 3600000UL;
-unsigned long lastDisplayUpdateMs = 0;
 
 // =========================
-// Hilfsfunktionen
+// Helpers
 // =========================
-
 void connectWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int tries = 0;
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    delay(300);
     tries++;
-    if (tries > 60) {   // nach ca. 30 Sekunden neu versuchen
-      ESP.restart();
-    }
+    if (tries > 120) ESP.restart();
   }
-
-  // Nach erfolgreicher Verbindung keine weiteren Debug-Ausgaben nötig
 }
 
-// Overload 1: für normale String-Variablen
-void sendWS(String &payload) {
-  webSocket.sendTXT(payload);
-}
-
-// Overload 2: für String-Literale ("REFRESH", etc.)
-void sendWS(const char *payload) {
-  String tmp(payload);
+void sendWS(const String& payload) {
+  // WebSockets 2.7.1 erwartet String& (nicht const)
+  String tmp = payload;
   webSocket.sendTXT(tmp);
 }
 
-// sehr einfache Root-Tag-Erkennung: <TAG ... >
 String getRootTag(const String& xml) {
   int start = xml.indexOf('<');
   if (start < 0) return "";
@@ -129,26 +114,16 @@ String getRootTag(const String& xml) {
   if (end < 0) return "";
   String tag = xml.substring(start + 1, end);
 
-  // Verarbeitung für <?xml ...?>: Suche nach schließendem ?>
   if (tag.startsWith("?")) {
     int closePos = xml.indexOf("?>", start);
-    if (closePos > start) {
-      return getRootTag(xml.substring(closePos + 2));
-    }
+    if (closePos > start) return getRootTag(xml.substring(closePos + 2));
   }
 
-  // Eventuelle Attribute abtrennen
   int spacePos = tag.indexOf(' ');
-  if (spacePos > 0) {
-    tag = tag.substring(0, spacePos);
-  }
+  if (spacePos > 0) tag = tag.substring(0, spacePos);
 
   tag.toUpperCase();
-
-  // Entferne ein evtl. vorangestelltes '?' aus <?xml ...>
-  if (tag.startsWith("?")) {
-    tag = tag.substring(1);
-  }
+  if (tag.startsWith("?")) tag = tag.substring(1);
   return tag;
 }
 
@@ -157,11 +132,9 @@ String extractAttribute(const String& block, const String& attr) {
   int pos = block.indexOf(marker);
   if (pos < 0) return "";
   pos += marker.length();
-  if (pos >= block.length()) return "";
+  if (pos >= (int)block.length()) return "";
   char quote = block.charAt(pos);
-  if (quote != '"' && quote != '\'') {
-    return "";
-  }
+  if (quote != '"' && quote != '\'') return "";
   int valueStart = pos + 1;
   int valueEnd = block.indexOf(quote, valueStart);
   if (valueEnd < 0) return "";
@@ -184,147 +157,13 @@ String extractTagValue(const String& block, const String& tag) {
 float parseTemperatureValue(String value) {
   value.replace(",", ".");
   int degreeIndex = value.indexOf("°");
-  if (degreeIndex >= 0) {
-    value = value.substring(0, degreeIndex);
-  }
+  if (degreeIndex >= 0) value = value.substring(0, degreeIndex);
   value.trim();
-  if (value.length() == 0) {
-    return NAN;
-  }
+  if (value.isEmpty()) return NAN;
   return value.toFloat();
 }
 
-void updateLedModeFromTemperature(float temperature) {
-  if (isnan(temperature)) {
-    return;
-  }
-
-  if (temperature < 30.0f) {
-    requestedLedMode = LED_MODE_RED_BLINK;
-  } else if (temperature < 35.0f) {
-    requestedLedMode = LED_MODE_ORANGE;
-  } else {
-    requestedLedMode = LED_MODE_GREEN;
-  }
-}
-
-void applyLedColor(uint8_t red, uint8_t green, uint8_t blue) {
-  statusPixel.setPixelColor(0, statusPixel.Color(red, green, blue));
-  statusPixel.show();
-}
-
-void handleStatusLed() {
-  unsigned long now = millis();
-
-  if (requestedLedMode == LED_MODE_RED_BLINK) {
-    if (appliedLedMode != LED_MODE_RED_BLINK) {
-      appliedLedMode   = LED_MODE_RED_BLINK;
-      ledBlinkOn       = false;
-      lastLedBlinkMs   = now;
-      applyLedColor(255, 0, 0);
-      return;
-    }
-
-    if (now - lastLedBlinkMs >= LED_BLINK_INTERVAL_MS) {
-      ledBlinkOn = !ledBlinkOn;
-      lastLedBlinkMs = now;
-      applyLedColor(ledBlinkOn ? 255 : 0, 0, 0);
-    }
-  } else {
-    if (appliedLedMode == LED_MODE_RED_BLINK) {
-      ledBlinkOn = false;
-    }
-
-    if (requestedLedMode != appliedLedMode) {
-      switch (requestedLedMode) {
-        case LED_MODE_RED:
-          applyLedColor(255, 0, 0);
-          break;
-        case LED_MODE_ORANGE:
-          applyLedColor(255, 120, 0);
-          break;
-        default:
-          applyLedColor(0, 255, 0);
-          break;
-      }
-      appliedLedMode = requestedLedMode;
-    }
-  }
-}
-
-bool getLocalTimeInfo(struct tm &timeinfo) {
-  if (!getLocalTime(&timeinfo, 100)) {
-    return false;
-  }
-  return true;
-}
-
-void syncTimeIfNeeded(bool force = false) {
-  unsigned long now = millis();
-  if (force || now - lastNtpSyncMs >= NTP_SYNC_INTERVAL_MS) {
-    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
-    struct tm timeinfo;
-    if (getLocalTimeInfo(timeinfo)) {
-      lastNtpSyncMs = now;
-    }
-  }
-}
-
-String formatTemperature(float value) {
-  if (isnan(value)) {
-    return "--.-";
-  }
-  char buffer[8];
-  dtostrf(value, 4, 1, buffer);
-  return String(buffer);
-}
-
-void updateDisplay() {
-  if (!displayReady) {
-    return;
-  }
-  struct tm timeinfo;
-  bool hasTime = getLocalTimeInfo(timeinfo);
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(WHITE);
-  display.setCursor(0, 0);
-
-  if (hasTime) {
-    char timeBuffer[20];
-    strftime(timeBuffer, sizeof(timeBuffer), "%d.%m %H:%M:%S", &timeinfo);
-    display.println(timeBuffer);
-  } else {
-    display.println("Zeit NTP...");
-  }
-
-  display.println("-------------------");
-  display.setTextSize(2);
-  display.print("A. ");
-  display.setTextSize(2);
-  display.print(formatTemperature(lastOutsideTemp));
-  display.setTextSize(2);
-  display.println("C");
-
-  display.print("WW. ");
-  display.setTextSize(2);
-  display.print(formatTemperature(lastWarmWaterTemp));
-  display.setTextSize(2);
-  display.println("C");
-
-  display.print("VL. ");
-  display.setTextSize(2);
-  display.print(formatTemperature(lastVorlaufTemp));
-  display.setTextSize(2);
-  display.println("C");
-
-  display.display();
-  lastDisplayUpdateMs = millis();
-  displayDirty = false;
-}
-
-// Sucht in der Navigation nach dem <item> mit <name>Temperaturen</name>
-// und merkt sich dessen id in tempNavId.
+// Suche in NAVIGATION nach Item "Temperaturen" und merke ID
 void findTemperatureNavId(const String& xml) {
   tempNavId = "";
 
@@ -336,42 +175,95 @@ void findTemperatureNavId(const String& xml) {
     int tagEnd = xml.indexOf('>', itemStart);
     if (tagEnd < 0) break;
 
-    // Nur das Start-Tag des Items
     String itemOpenTag = xml.substring(itemStart, tagEnd + 1);
     String id = extractAttribute(itemOpenTag, "id");
 
-    // Das erste <name> hinter diesem <item>-Tag gehört in der Regel zu diesem Item
     int nameStart = xml.indexOf("<name>", tagEnd);
-    if (nameStart < 0) {
-      pos = tagEnd + 1;
-      continue;
-    }
+    if (nameStart < 0) { pos = tagEnd + 1; continue; }
     int nameEnd = xml.indexOf("</name>", nameStart);
-    if (nameEnd < 0) {
-      pos = tagEnd + 1;
-      continue;
-    }
+    if (nameEnd < 0) { pos = tagEnd + 1; continue; }
 
     String name = xml.substring(nameStart + 6, nameEnd);
     name.trim();
 
-    // Auf "Temperaturen" prüfen (ohne Rücksicht auf Groß/Kleinschreibung)
-    String cmp = name;
-    cmp.toLowerCase();
+    String cmp = name; cmp.toLowerCase();
     if (cmp == "temperaturen") {
       tempNavId = id;
       break;
     }
-
     pos = tagEnd + 1;
   }
 }
 
-// Liest alle <item>…</item>-Blöcke aus CONTENT/VALUES und gibt Name: Wert aus
-void printTemperaturesFromContent(const String& xml) {
+String fmt1(float v) {
+  if (isnan(v)) return "--.-";
+  char b[8];
+  dtostrf(v, 4, 1, b);
+  return String(b);
+}
+
+bool getLocalTimeInfo(struct tm &timeinfo) {
+  return getLocalTime(&timeinfo, 100);
+}
+
+void syncTimeIfNeeded(bool force = false) {
+  unsigned long now = millis();
+  if (force || now - lastNtpSyncMs >= NTP_SYNC_INTERVAL_MS) {
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+    struct tm timeinfo;
+    if (getLocalTimeInfo(timeinfo)) lastNtpSyncMs = now;
+  }
+}
+
+// ===== Display =====
+void renderDisplay() {
+  gfx->fillScreen(BLACK);
+  gfx->setTextColor(WHITE);
+
+  // Header klein
+  gfx->setTextSize(1);
+  gfx->setCursor(0, 0);
+  gfx->print("Luxtronik Temps  IP ");
+  gfx->println(WiFi.localIP());
+
+  struct tm t;
+  gfx->setCursor(0, 12);
+  if (getLocalTimeInfo(t)) {
+    char buf[20];
+    strftime(buf, sizeof(buf), "%d.%m %H:%M:%S", &t);
+    gfx->println(buf);
+  } else {
+    gfx->println("NTP...");
+  }
+
+  gfx->drawFastHLine(0, 26, gfx->width(), WHITE);
+
+  // Werte groß
+  int y = 34;
+  gfx->setTextSize(2);
+
+  gfx->setCursor(0, y);
+  gfx->print("A: ");
+  gfx->print(fmt1(lastOutsideTemp));
+  gfx->println("C");
+
+  y += 26;
+  gfx->setCursor(0, y);
+  gfx->print("WW:");
+  gfx->print(fmt1(lastWarmWaterTemp));
+  gfx->println("C");
+
+  y += 26;
+  gfx->setCursor(0, y);
+  gfx->print("VL:");
+  gfx->print(fmt1(lastVorlaufTemp));
+  gfx->println("C");
+}
+
+// Parse nur die Temperatur-Seite und update die 3 Werte
+void parseTemperaturesFromContent(const String& xml) {
   int pos = 0;
-  bool warmWaterFound = false;
-  float detectedWarmWater = NAN;
+
   while (true) {
     int itemStart = xml.indexOf("<item", pos);
     if (itemStart < 0) break;
@@ -380,62 +272,43 @@ void printTemperaturesFromContent(const String& xml) {
     if (itemEnd < 0) break;
 
     String block = xml.substring(itemStart, itemEnd + 7);
-
     String name  = extractTagValue(block, "name");
     String value = extractTagValue(block, "value");
 
-    if (name.length() > 0 && value.length() > 0) {
-      name.trim();
-      value.trim();
-      Serial.print(name);
-      Serial.print(": ");
-      Serial.println(value);
+    if (name.length() && value.length()) {
+      String lowered = name;
+      lowered.toLowerCase();
+      lowered.replace(" ", "");
+      lowered.replace("_", "");
+      lowered.replace("-", "");
 
-      String loweredName = name;
-      loweredName.toLowerCase();
-      loweredName.replace(" ", "");
-      if (loweredName.indexOf("warmwasser-ist") >= 0 || loweredName == "warmwasserist") {
-        float parsed = parseTemperatureValue(value);
-        if (!isnan(parsed)) {
-          detectedWarmWater = parsed;
-          warmWaterFound = true;
-        }
+      // Luxtronik kann je nach Firmware leicht andere Namen liefern:
+      // Außen: "Aussentemperatur", Warmwasser: "Warmwasser-Ist", Vorlauf: "Vorlauf"
+      if (lowered.indexOf("aussentemperatur") >= 0 || lowered.indexOf("außentemperatur") >= 0) {
+        float v = parseTemperatureValue(value);
+        if (!isnan(v)) lastOutsideTemp = v;
       }
 
-      if (loweredName.indexOf("aussentemperatur") >= 0) {
-        float parsed = parseTemperatureValue(value);
-        if (!isnan(parsed)) {
-          lastOutsideTemp = parsed;
-          displayDirty = true;
-        }
+      if (lowered.indexOf("warmwasserist") >= 0 || lowered.indexOf("warmwasser-ist") >= 0 || lowered.indexOf("warmwasser") >= 0) {
+        float v = parseTemperatureValue(value);
+        if (!isnan(v)) lastWarmWaterTemp = v;
       }
 
-      if (loweredName == "vorlauf") {
-        float parsed = parseTemperatureValue(value);
-        if (!isnan(parsed)) {
-          lastVorlaufTemp = parsed;
-          displayDirty = true;
-        }
+      if (lowered == "vorlauf" || lowered.indexOf("vorlauf") >= 0) {
+        float v = parseTemperatureValue(value);
+        if (!isnan(v)) lastVorlaufTemp = v;
       }
     }
 
     pos = itemEnd + 7;
   }
 
-  if (warmWaterFound) {
-    lastWarmWaterTemp = detectedWarmWater;
-    updateLedModeFromTemperature(detectedWarmWater);
-    displayDirty = true;
-  }
-  if (displayDirty) {
-    updateDisplay();
-  }
+  renderDisplay();
 }
 
 // =========================
-// WebSocket-Event-Handler
+// WebSocket Event
 // =========================
-
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_DISCONNECTED:
@@ -443,54 +316,34 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       break;
 
     case WStype_CONNECTED: {
-      // LOGIN & erster REFRESH
+      // LOGIN
       String loginCmd = "LOGIN;";
       loginCmd += CONTROLLER_PASSWORD;
       sendWS(loginCmd);
       loggedIn = true;
 
-      // Navigation anfordern
+      // NAV anfordern
       sendWS("REFRESH");
       lastRefreshMs = millis();
-      cycleComplete = false;
       break;
     }
 
     case WStype_TEXT: {
       String msg = String((char*)payload).substring(0, length);
-
       String root = getRootTag(msg);
 
       if (root == "NAVIGATION" || root == "NAV") {
-        // Navigation erhalten -> ID für "Temperaturen" suchen
+        // finde die Seite "Temperaturen" und hole nur die
         findTemperatureNavId(msg);
-
         if (tempNavId.length() > 0) {
-          // Genau einen GET für die Temperatur-Seite schicken
-          String cmd = "GET;";
-          cmd += tempNavId;
-          sendWS(cmd);
-          cycleComplete = false;
-        } else {
-          // Keine passende Navigation gefunden -> Zyklus beenden
-          cycleComplete = true;
+          sendWS("GET;" + tempNavId);
         }
-
       } else if (root == "CONTENT" || root == "VALUES") {
-        // Inhalt der Temperature-Seite parsen und ausgeben
-        printTemperaturesFromContent(msg);
-        cycleComplete = true;
+        // Temperatur-Seite auswerten
+        parseTemperaturesFromContent(msg);
       }
       break;
     }
-
-    case WStype_PING:
-      // keepalive
-      break;
-
-    case WStype_PONG:
-      // Antwort auf Ping
-      break;
 
     default:
       break;
@@ -498,72 +351,48 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 }
 
 // =========================
-// Arduino setup & loop
+// setup & loop
 // =========================
-
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(200);
 
-  if (STATUS_LED_POWER_PIN >= 0) {
-    pinMode(STATUS_LED_POWER_PIN, OUTPUT);
-    digitalWrite(STATUS_LED_POWER_PIN, HIGH);
-  }
+  // Backlight
+  pinMode(PIN_LCD_BL, OUTPUT);
+  digitalWrite(PIN_LCD_BL, HIGH);
 
-  statusPixel.begin();
-  statusPixel.setBrightness(128);
-  statusPixel.show();
-
-  displayReady = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-  if (!displayReady) {
-    Serial.println("SSD1306 nicht gefunden");
-  } else {
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(WHITE);
-    display.setCursor(0, 0);
-    display.println("Luxtronik Monitor");
-    display.display();
-  }
+  gfx->begin();
+  gfx->fillScreen(BLACK);
+  gfx->setTextColor(WHITE);
+  gfx->setTextSize(1);
+  gfx->setCursor(0, 0);
+  gfx->println("Luxtronik Temps...");
+  gfx->println("WiFi connect...");
 
   connectWifi();
+  syncTimeIfNeeded(true);
 
-  // WebSocket konfigurieren
+  renderDisplay();
+
   webSocket.begin(CONTROLLER_IP, CONTROLLER_PORT, "/", WS_PROTOCOL);
-  webSocket.setExtraHeaders("");  // optional
   webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(5000);  // 5s Reconnect
-  webSocket.setAuthorization("", "");    // keine Auth hier
+  webSocket.setReconnectInterval(5000);
+  webSocket.setExtraHeaders("");
+  webSocket.setAuthorization("", "");
 
   lastRefreshMs = millis();
-  applyLedColor(0, 255, 0);
-  syncTimeIfNeeded(true);
 }
 
 void loop() {
   webSocket.loop();
-  handleStatusLed();
   syncTimeIfNeeded();
 
-  // Wenn wir nur einmal laufen wollen und der Zyklus fertig ist:
-  if (RUN_ONCE && cycleComplete) {
-    // Hier könntest du z.B. auch in DeepSleep gehen
-    // ESP.deepSleep(0);
-    return;
-  }
+  if (!loggedIn) return;
 
-  // Mehrfach-Zyklen sind hier nicht nötig, aber Logik bleibt zur Sicherheit drin
-  if (!RUN_ONCE && loggedIn) {
-    unsigned long now = millis();
-    if (cycleComplete && (now - lastRefreshMs >= REFRESH_INTERVAL_SEC * 1000UL)) {
-      // neuen REFRESH nur, wenn man zyklisch laufen möchte
-      sendWS("REFRESH");
-      lastRefreshMs = now;
-      cycleComplete = true;
-    }
-  }
-
-  if (displayDirty || millis() - lastDisplayUpdateMs >= REFRESH_INTERVAL_SEC * 1000UL) {
-    updateDisplay();
+  unsigned long now = millis();
+  if (!RUN_ONCE && (now - lastRefreshMs >= REFRESH_INTERVAL_SEC * 1000UL)) {
+    // Alle 3 Sekunden: REFRESH -> NAVIGATION -> GET;tempNavId -> CONTENT
+    sendWS("REFRESH");
+    lastRefreshMs = now;
   }
 }
